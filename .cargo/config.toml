@@ -1,0 +1,20 @@
+[alias]
+emitter   = "run --release --bin emitter"
+receiver  = "run --release --bin receiver"
+source    = "run --release --bin source"
+collector = "run --release --bin collector"
+
+[target.riscv32imac-unknown-none-elf]
+runner = "espflash flash --monitor --chip esp32c5"
+rustflags = [
+    "-C", "link-arg=-Tlinkall.x",
+    "-C", "force-frame-pointers",
+]
+
+[build]
+target = "riscv32imac-unknown-none-elf"
+
+[env]
+ESP_LOG = "info"
+# esp-csi-rs UART logger baud (only used if you force the `uart` feature).
+MONITOR_BAUD = "115200"

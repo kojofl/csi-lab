@@ -1,0 +1,251 @@
+//! The **source** end of the ESP-NOW simplex exchange: a central listener.
+//!
+//! Built by [`SimplexConfig::source`](crate::SimplexConfig::source) /
+//! [`CSINode::esp_now_simplex_source`](crate::CSINode::esp_now_simplex_source). The module keeps
+//! the name it had when this end was called the "fast source" and filed under `peripheral`.
+//!
+//! The source listens for the [peer](crate::SimplexConfig::peer)'s discovery beacon, learns the
+//! peer's MAC, registers it as a **unicast peer with a forced PHY** (HT20 MCS7-LGI by default,
+//! HT40 when a secondary channel is set), sends one magic-tagged hello so the peer switches to
+//! RX-only, then unicasts a **continuous max-rate flood**. Unlike the symmetric exchange's
+//! peripheral there is no per-control-packet reply gating and no adaptive pacing — the source
+//! transmits as fast as `send_async` completes (or at the traffic frequency, when one is set),
+//! which with the peer silent drives the maximum CSI packets/sec at the peer.
+
+use embassy_futures::select::{Either, select};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
+use portable_atomic::AtomicU32;
+
+use esp_radio::esp_now::{
+    Error as EspNowInnerError, EspNow, EspNowError, EspNowWifiInterface, PeerInfo, WifiPhyRate,
+};
+
+use crate::espnow_phy::with_espnow_recv_suspended;
+use crate::{
+    CENTRAL_MAGIC_NUMBER, ControlPacket, EspNowConfig, IOTaskConfig, PERIPHERAL_MAGIC_NUMBER,
+    PeripheralPacket, STOP_SIGNAL, apply_peer_espnow_phy, log_ln, parse_with_magic,
+    serialize_with_magic,
+};
+#[cfg(feature = "statistics")]
+use crate::STATS;
+#[cfg(feature = "statistics")]
+use portable_atomic::Ordering;
+
+/// Backoff when Wi-Fi TX buffers are full (`OutOfMemory` / `SendFailed`).
+const TX_BACKOFF_US: u64 = 200;
+/// How often (in sends) to re-verify the unicast peer still exists. Power of two
+/// so the check is a cheap mask.
+const PEER_HEALTHCHECK_PERIOD: u16 = 256;
+/// Flood-frame scratch buffer (4-byte magic + small postcard body).
+const FLOOD_BUF_LEN: usize = 16;
+
+/// PATCHED (csi-lab): upper bound on waiting for a send-complete callback. Upstream
+/// awaited it with no timeout, so one lost callback froze the source for good.
+const SEND_TIMEOUT: Duration = Duration::from_millis(50);
+/// PATCHED (csi-lab): consecutive send timeouts before the unicast peer is rebuilt.
+const REPAIR_AFTER_TIMEOUTS: u32 = 10;
+
+/// PATCHED (csi-lab): source TX counters, for the application to report.
+/// Sends that completed and were ACKed by the collector.
+pub static SOURCE_TX_OK: AtomicU32 = AtomicU32::new(0);
+/// Sends that completed without an ACK, or were refused by the driver.
+pub static SOURCE_TX_FAILED: AtomicU32 = AtomicU32::new(0);
+/// Sends whose completion callback never arrived within `SEND_TIMEOUT`.
+pub static SOURCE_TX_TIMEOUT: AtomicU32 = AtomicU32::new(0);
+/// Times the unicast peer was rebuilt after repeated timeouts.
+pub static SOURCE_PEER_REBUILDS: AtomicU32 = AtomicU32::new(0);
+
+fn add_collector_peer(esp_now: &EspNow<'static>, mac: &[u8; 6], channel: u8) -> bool {
+    if esp_now.peer_exists(mac) {
+        return true;
+    }
+    esp_now
+        .add_peer(PeerInfo {
+            interface: EspNowWifiInterface::Station,
+            peer_address: *mac,
+            lmk: None,
+            channel: Some(channel),
+            encrypt: false,
+        })
+        .is_ok()
+}
+
+/// Run the simplex source end: discover the peer → forced-PHY unicast flood.
+pub async fn run_esp_now_fast_source(
+    esp_now: &mut EspNow<'static>,
+    config: &EspNowConfig,
+    freq_hz: Option<u16>,
+    _io_tasks: IOTaskConfig,
+) {
+    let peer_mac = config.peer_mac();
+    let send_magic = peer_mac.is_none();
+
+    // In HT40 mode the channel (+secondary) was already set on the controller
+    // before this task ran; skip set_channel so the secondary isn't reset.
+    if config.secondary_channel().is_none() {
+        with_espnow_recv_suspended(|| {
+            esp_now.set_channel(config.channel).unwrap();
+        });
+    }
+    log_ln!("esp-now version {}", esp_now.version().unwrap());
+
+    // Forced unicast PHY: default to HT20 MCS7-LGI for max throughput unless the
+    // user forced a specific rate. Applied to the learned collector peer below.
+    let rate = if config.force_phy() {
+        *config.phy_rate()
+    } else {
+        WifiPhyRate::RateMcs7Lgi
+    };
+
+    // ---- Phase 1: discover the collector -----------------------------------
+    let collector_mac: [u8; 6] = match peer_mac {
+        Some(mac) => mac,
+        None => loop {
+            match select(STOP_SIGNAL.wait(), crate::esp_now_pool::receive_async()).await {
+                Either::First(_) => {
+                    log_ln!("STOP signal received, shutting down fast source...");
+                    STOP_SIGNAL.signal(());
+                    return;
+                }
+                Either::Second(r) => {
+                    if parse_with_magic::<ControlPacket>(r.data(), CENTRAL_MAGIC_NUMBER, true)
+                        .is_some()
+                    {
+                        break r.info.src_address;
+                    }
+                }
+            }
+        },
+    };
+
+    // Register the collector as a unicast peer and force the PHY (recv-suspended,
+    // C5-safe — per-peer rate config on a unicast peer works on all chips).
+    add_collector_peer(esp_now, &collector_mac, config.channel);
+    apply_peer_espnow_phy(&collector_mac, rate, config.secondary_channel());
+    log_ln!(
+        "ESP-NOW fast source: locked collector {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, unicast flood rate {:?}",
+        collector_mac[0],
+        collector_mac[1],
+        collector_mac[2],
+        collector_mac[3],
+        collector_mac[4],
+        collector_mac[5],
+        rate,
+    );
+
+    // One magic-tagged hello so the collector deterministically stops beaconing
+    // and switches to RX-only (auto-pairing only; manual mode pre-latches).
+    if send_magic {
+        let mut hello_buf = [0u8; 8];
+        if let Ok(hello) = serialize_with_magic(
+            &PeripheralPacket::new(),
+            PERIPHERAL_MAGIC_NUMBER,
+            true,
+            &mut hello_buf,
+        ) {
+            let _ = esp_now.send_async(&collector_mac, hello).await;
+        }
+    }
+
+    // ---- Phase 2: continuous flood -----------------------------------------
+    // Optional rate cap (None = flat-out; the send_async completion is the
+    // natural limiter as the radio frees TX buffers).
+    let cap_interval_us = freq_hz.map(|f| 1_000_000u64 / (f.max(1) as u64));
+    let mut next_tx_us = Instant::now().as_micros();
+    #[cfg(feature = "statistics")]
+    let mut seq: u32 = 0;
+    let mut tx_buf = [0u8; FLOOD_BUF_LEN];
+    let mut healthcheck: u16 = 0;
+    let mut consecutive_timeouts: u32 = 0;
+
+    loop {
+        if STOP_SIGNAL.signaled() {
+            log_ln!("STOP signal received, shutting down fast source...");
+            STOP_SIGNAL.signal(());
+            break;
+        }
+
+        // Periodic peer healthcheck — the driver peer table can churn under
+        // pressure; keep the unicast peer present so TX doesn't stall on NotFound.
+        healthcheck = healthcheck.wrapping_add(1);
+        if (healthcheck & (PEER_HEALTHCHECK_PERIOD - 1)) == 0 && !esp_now.peer_exists(&collector_mac)
+        {
+            add_collector_peer(esp_now, &collector_mac, config.channel);
+            apply_peer_espnow_phy(&collector_mac, rate, config.secondary_channel());
+        }
+
+        let pkt = ControlPacket::new(
+            false,
+            #[cfg(feature = "statistics")]
+            seq,
+        );
+        let msg = match serialize_with_magic(&pkt, CENTRAL_MAGIC_NUMBER, send_magic, &mut tx_buf) {
+            Ok(m) => m,
+            Err(_) => {
+                log_ln!("Failed to serialize ESP-NOW flood packet");
+                break;
+            }
+        };
+
+        // Exactly one send in flight, awaited to completion — never drop or
+        // queue a second send first (the driver has one global completion flag).
+        match with_timeout(SEND_TIMEOUT, esp_now.send_async(&collector_mac, msg)).await {
+            Ok(Ok(())) => {
+                consecutive_timeouts = 0;
+                SOURCE_TX_OK.fetch_add(1, portable_atomic::Ordering::Relaxed);
+                #[cfg(feature = "statistics")]
+                {
+                    STATS.tx_count.fetch_add(1, Ordering::Relaxed);
+                    seq = seq.wrapping_add(1);
+                }
+            }
+            Ok(Err(EspNowError::Error(EspNowInnerError::OutOfMemory) | EspNowError::SendFailed)) => {
+                consecutive_timeouts = 0;
+                SOURCE_TX_FAILED.fetch_add(1, portable_atomic::Ordering::Relaxed);
+                match select(STOP_SIGNAL.wait(), Timer::after_micros(TX_BACKOFF_US)).await {
+                    Either::First(_) => {
+                        STOP_SIGNAL.signal(());
+                        break;
+                    }
+                    Either::Second(_) => {}
+                }
+            }
+            Ok(Err(e)) => {
+                SOURCE_TX_FAILED.fetch_add(1, portable_atomic::Ordering::Relaxed);
+                log_ln!("Failed to send ESP-NOW flood packet: {:?}", e);
+            }
+            Err(_timeout) => {
+                SOURCE_TX_TIMEOUT.fetch_add(1, portable_atomic::Ordering::Relaxed);
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= REPAIR_AFTER_TIMEOUTS {
+                    log_ln!(
+                        "ESP-NOW fast source: {} send timeouts in a row, rebuilding peer",
+                        consecutive_timeouts
+                    );
+                    let _ = esp_now.remove_peer(&collector_mac);
+                    add_collector_peer(esp_now, &collector_mac, config.channel);
+                    apply_peer_espnow_phy(&collector_mac, rate, config.secondary_channel());
+                    SOURCE_PEER_REBUILDS.fetch_add(1, portable_atomic::Ordering::Relaxed);
+                    consecutive_timeouts = 0;
+                }
+            }
+        }
+
+        // Optional rate cap.
+        if let Some(interval) = cap_interval_us {
+            next_tx_us = next_tx_us.saturating_add(interval);
+            let now = Instant::now().as_micros();
+            if next_tx_us > now {
+                match select(STOP_SIGNAL.wait(), Timer::after_micros(next_tx_us - now)).await {
+                    Either::First(_) => {
+                        STOP_SIGNAL.signal(());
+                        break;
+                    }
+                    Either::Second(_) => {}
+                }
+            }
+        }
+    }
+
+    log_ln!("Node Stopped. Halting flood.");
+}

@@ -1,0 +1,74 @@
+[package]
+name = "csi-lab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "ESP32-C5 Wi-Fi CSI lab nodes (ESP-NOW simplex source + collector) on esp-csi-rs"
+
+# 1 TX : N RX (main setup): `emitter` on one board, `receiver` on every RX board.
+# 1 TX : 1 RX (quick pair test): `source` + `collector`.
+[[bin]]
+name = "emitter"
+path = "src/bin/emitter.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "receiver"
+path = "src/bin/receiver.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "source"
+path = "src/bin/source.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "collector"
+path = "src/bin/collector.rs"
+test = false
+bench = false
+
+[dependencies]
+esp-csi-rs = { version = "0.11", default-features = false, features = ["esp32c5", "no-std", "println", "auto"] }
+
+# Versions pinned to what esp-csi-rs 0.11 is built against.
+esp-hal = { version = "~1.1", features = ["esp32c5", "unstable"] }
+esp-radio = { version = "0.18", features = ["esp32c5", "wifi", "esp-now", "csi", "unstable"] }
+esp-rtos = { version = "0.3", features = ["esp32c5", "embassy", "esp-alloc", "esp-radio"] }
+esp-alloc = { version = "0.10", features = ["esp32c5"] }
+esp-backtrace = { version = "0.19", features = ["esp32c5", "panic-handler", "println"] }
+esp-println = { version = "0.17", features = ["esp32c5"] }
+esp-bootloader-esp-idf = { version = "0.5", features = ["esp32c5"] }
+log = "0.4"
+embassy-executor = "0.10"
+embassy-time = "0.5"
+static_cell = "2.1"
+portable-atomic = "1.13"
+
+[patch.crates-io]
+# esp-radio 0.18.0 with one fix: the ESP32-C5 CsiConfig -> wifi_csi_acquire_config_t
+# mapping (see patches/esp-radio/src/wifi/csi.rs, "PATCHED"). Without it, HT40
+# acquisition is silently off on the C5. Drop this once upstream is fixed.
+esp-radio = { path = "patches/esp-radio" }
+# esp-csi-rs 0.11.0 with 5 GHz band selection + HT40 RX/TX for the ESP-NOW modes, and a
+# `CSINode::esp_now_simplex(SimplexConfig, ..)` / `SimplexConfig::with_ht40` API
+# (search for "PATCHED" in patches/esp-csi-rs/src/lib).
+esp-csi-rs = { path = "patches/esp-csi-rs" }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.dev.package.esp-radio]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "s"
+overflow-checks = false
